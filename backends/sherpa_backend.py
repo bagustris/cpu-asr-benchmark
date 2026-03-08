@@ -43,10 +43,26 @@ class SherpaBackend(ASRBackend):
             )
         return str(matches[0])
 
+    def _is_nemo_transducer(self) -> bool:
+        """Return True if the model dir looks like an offline NeMo transducer.
+
+        Online zipformer encoders always have '-chunk-' in the filename
+        (e.g. encoder-epoch-99-avg-1-chunk-16-left-128.onnx).  NeMo parakeet
+        encoders use a simple name like encoder.onnx / encoder.int8.onnx.
+        """
+        matches = sorted(self.model_dir.glob("encoder*.onnx"))
+        return bool(matches) and not any("-chunk-" in m.name for m in matches)
+
     def load(self) -> None:
         import sherpa_onnx
 
-        if self.model_type == "nemo_transducer":
+        # Auto-detect NeMo transducer when model_type was left at the default
+        # "online" but the encoder file doesn't carry the zipformer chunk suffix.
+        effective_type = self.model_type
+        if effective_type == "online" and self._is_nemo_transducer():
+            effective_type = "nemo_transducer"
+
+        if effective_type == "nemo_transducer":
             self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
                 tokens=self._find("tokens.txt"),
                 encoder=self._find("encoder*.onnx"),
@@ -58,6 +74,7 @@ class SherpaBackend(ASRBackend):
                 decoding_method="greedy_search",
                 model_type="nemo_transducer",
             )
+            self.model_type = "nemo_transducer"  # keep transcribe() in sync
         else:
             self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
                 tokens=self._find("tokens.txt"),
