@@ -1,11 +1,11 @@
 """
-Sherpa-ONNX backend (streaming Zipformer transducer).
+Sherpa-ONNX backend.
 
-Corresponds to the live-asr-sherpa project.
-Model: sherpa-onnx-streaming-zipformer-en-2023-06-26
-
-For benchmarking we simulate streaming by feeding fixed-size chunks to the
-online recogniser and collecting the final result after all audio is consumed.
+Supports two model types:
+  - "online"  (default): streaming Zipformer transducer via OnlineRecognizer.
+    Simulates streaming by feeding fixed-size chunks; matches live-asr-sherpa.
+  - "nemo_transducer": offline NeMo Parakeet TDT via OfflineRecognizer.
+    Passes full audio at once; use with --sherpa-model-type nemo_transducer.
 """
 
 from __future__ import annotations
@@ -25,12 +25,14 @@ class SherpaBackend(ASRBackend):
         model_dir: str = "model",
         num_threads: int = 4,
         sample_rate: int = 16000,
-        chunk_size: float = 0.1,  # seconds per simulated chunk
+        chunk_size: float = 0.1,  # seconds per simulated chunk (online only)
+        model_type: str = "online",  # "online" or "nemo_transducer"
     ) -> None:
         self.model_dir = Path(model_dir)
         self.num_threads = num_threads
         self.sample_rate = sample_rate
         self.chunk_frames = int(sample_rate * chunk_size)
+        self.model_type = model_type
         self._recognizer = None
 
     def _find(self, pattern: str) -> str:
@@ -44,26 +46,51 @@ class SherpaBackend(ASRBackend):
     def load(self) -> None:
         import sherpa_onnx
 
-        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-            tokens=self._find("tokens.txt"),
-            encoder=self._find("encoder*.onnx"),
-            decoder=self._find("decoder*.onnx"),
-            joiner=self._find("joiner*.onnx"),
-            num_threads=self.num_threads,
-            sample_rate=self.sample_rate,
-            feature_dim=80,
-            enable_endpoint_detection=True,
-            rule1_min_trailing_silence=2.4,
-            rule2_min_trailing_silence=1.2,
-            rule3_min_utterance_length=20.0,
-            decoding_method="greedy_search",
-        )
+        if self.model_type == "nemo_transducer":
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                tokens=self._find("tokens.txt"),
+                encoder=self._find("encoder*.onnx"),
+                decoder=self._find("decoder*.onnx"),
+                joiner=self._find("joiner*.onnx"),
+                num_threads=self.num_threads,
+                sample_rate=self.sample_rate,
+                feature_dim=80,
+                decoding_method="greedy_search",
+                model_type="nemo_transducer",
+            )
+        else:
+            self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=self._find("tokens.txt"),
+                encoder=self._find("encoder*.onnx"),
+                decoder=self._find("decoder*.onnx"),
+                joiner=self._find("joiner*.onnx"),
+                num_threads=self.num_threads,
+                sample_rate=self.sample_rate,
+                feature_dim=80,
+                enable_endpoint_detection=True,
+                rule1_min_trailing_silence=2.4,
+                rule2_min_trailing_silence=1.2,
+                rule3_min_utterance_length=20.0,
+                decoding_method="greedy_search",
+            )
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
-        """Feed audio in chunks to the streaming recogniser; return final text."""
         if audio.size == 0:
             return ""
 
+        if self.model_type == "nemo_transducer":
+            return self._transcribe_offline(audio, sample_rate)
+        return self._transcribe_online(audio, sample_rate)
+
+    def _transcribe_offline(self, audio: np.ndarray, sample_rate: int) -> str:
+        """Pass full audio to offline NeMo recogniser."""
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(sample_rate, audio)
+        self._recognizer.decode_stream(stream)
+        return stream.result.text.strip()
+
+    def _transcribe_online(self, audio: np.ndarray, sample_rate: int) -> str:
+        """Feed audio in chunks to the streaming recogniser; return final text."""
         recognizer = self._recognizer
         stream = recognizer.create_stream()
 
@@ -84,4 +111,7 @@ class SherpaBackend(ASRBackend):
             recognizer.decode_stream(stream)
 
         result = recognizer.get_result(stream)
+        # sherpa-onnx >= 1.10 returns a plain string from get_result()
+        if isinstance(result, str):
+            return result.strip()
         return result.text.strip()

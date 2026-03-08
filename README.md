@@ -6,7 +6,7 @@ CPU-only ASR backends on your own test data.
 | Backend | Library | Model |
 |---------|---------|-------|
 | `onnx` | [onnx-asr](https://github.com/yeyupiaoling/ONNX-ASR) + ONNX Runtime | NeMo Parakeet TDT 0.6B v2 |
-| `sherpa` | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Zipformer streaming transducer (EN, 2023-06-26) |
+| `sherpa` | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Zipformer streaming transducer (EN, 2023-06-26), Parakeet TDT V2 EN |
 | `whisper` | [faster-whisper](https://github.com/guillaumekln/faster-whisper) (CTranslate2, int8) | Whisper small (or any size) |
 
 ## Metrics
@@ -14,7 +14,7 @@ CPU-only ASR backends on your own test data.
 ### WER — Word Error Rate
 
 Computed from scratch using the [`editdistance`](https://pypi.org/project/editdistance/) package,
-following the approach in [speechain](https://github.com/human-ai-interaction/speechain):
+following the approach in [speechain](https://github.com/human-ai-lab/speechain):
 
 ```
 WER = Σ edit_distance(hyp_words, ref_words) / Σ len(ref_words)
@@ -53,7 +53,7 @@ pip install sherpa-onnx
 pip install faster-whisper
 ```
 
-### 3. Prepare a manifest
+### 3. Prepare a manifest (optional)  
 
 Create a TSV file with audio paths and reference transcripts:
 
@@ -90,18 +90,26 @@ python benchmark.py --manifest data/test-clean.tsv \
 # Sherpa with custom model directory
 python benchmark.py --manifest data/test-clean.tsv \
     --backends sherpa \
-    --sherpa-model-dir /path/to/sherpa-onnx-model
+    --sherpa-model-dir /path/to/sherpa-onnx-model \
+    --sherpa-model-type model-type-name
 
 # Save full results to JSON
 python benchmark.py --manifest data/test-clean.tsv \
     --output results.json
 
 # Verbose: show REF/HYP for each utterance
-python benchmark.py --manifest data/test-clean.tsv --verbose
+python benchmark.py --manifest data/test-clean.tsv --verbose 
+
+# Direclyly specify audio and reference pairs without a manifest
+python3 benchmark.py \
+      --data-dir /data/LibriSpeech/dev-clean-2 \
+      --backends sherpa \
+      --sherpa-model-dir /home/bagus/github/live-asr-sherpa/src/model-parakeet \
+      --output results_sherpa_parakeet.json
+
 ```
 
-## Output
-
+## Output  
 ```
 ============================================================
   Backend: ONNX
@@ -120,11 +128,12 @@ python benchmark.py --manifest data/test-clean.tsv --verbose
 ============================================================
   SUMMARY
 ============================================================
-  Backend        WER (%)   Mean RTF   #Utts
+  Backend             WER (%)   RTF       #Utts
   ----------------------------------------------
-  onnx              4.21     0.1970     100
-  sherpa            6.83     0.3120     100
-  whisper           3.14     0.5840     100
+  onnx (parakeet)     1.84      0.1559    1089
+  sherpa-zipformer    3.18      0.0533    1089
+  whisper             4.71      0.2767    1089
+  sherpa-parakeet     1.84      0.0834    1089
 ============================================================
 ```
 

@@ -1,18 +1,15 @@
 # Core benchmark dependencies
-editdistance>=0.6.3
-soundfile>=0.12.1
-numpy>=1.24.0
+editdistance==0.8.1
+soundfile==0.13.1
+numpy==2.2.6
+resampy==0.4.3
 
-# Optional: resampling support for non-16 kHz audio
-# resampy>=0.4.2
+# ONNX backend
+onnx-asr==0.10.2
+onnxruntime==1.23.2
 
-# ASR backends (install whichever you intend to benchmark)
-# onnx backend:
-# onnx-asr>=0.3.0
-# onnxruntime>=1.17.0
+# Sherpa-ONNX backend
+sherpa-onnx==1.12.28
 
-# sherpa backend:
-# sherpa-onnx>=1.10.0
-
-# whisper backend:
-# faster-whisper>=1.0.0
+# Whisper backend
+faster-whisper==1.2.1

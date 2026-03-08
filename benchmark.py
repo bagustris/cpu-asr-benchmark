@@ -7,21 +7,21 @@ Supported backends:
   sherpa  → Zipformer transducer via sherpa-onnx
   whisper → faster-whisper (CTranslate2, int8)
 
-Input manifest (--manifest): a TSV or CSV file with two columns:
-  audio_path  <TAB or COMMA>  reference_text
+Input — one of:
+  --data-dir PATH   LibriSpeech split directory (auto-builds manifest)
+  --manifest FILE   Pre-built TSV/CSV: audio_path <sep> reference_text
 
 Example
 -------
-  # Benchmark all backends on LibriSpeech test-clean manifest
-  python benchmark.py --manifest data/test-clean.tsv --backends onnx sherpa whisper
+  # Run all backends on LibriSpeech dev-clean-2
+  python benchmark.py --data-dir /data/LibriSpeech/dev-clean-2
 
-  # Only run whisper with a specific model
-  python benchmark.py --manifest data/test-clean.tsv --backends whisper \\
-      --whisper-model base --whisper-threads 8
+  # Only whisper, save JSON results
+  python benchmark.py --data-dir /data/LibriSpeech/dev-clean-2 \\
+      --backends whisper --whisper-model base --output results.json
 
-  # Run onnx and whisper, save results to JSON
-  python benchmark.py --manifest data/test-clean.tsv --backends onnx whisper \\
-      --output results.json
+  # Use a pre-built manifest
+  python benchmark.py --manifest data/test-clean.tsv --backends onnx sherpa
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -42,57 +41,67 @@ from metrics import AggregateMetrics, UtteranceResult
 from backends import OnnxBackend, SherpaBackend, WhisperBackend
 from backends.base import ASRBackend
 
+# Default paths
+DEFAULT_DATA_DIR = "/data/LibriSpeech/dev-clean-2"
+DEFAULT_SHERPA_MODEL = str(
+    Path(__file__).resolve().parent.parent / "live-asr-sherpa" / "src" / "model"
+)
+
 
 # ---------------------------------------------------------------------------
-# Audio loading
+# Manifest generation from LibriSpeech directory
 # ---------------------------------------------------------------------------
 
-def load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, float]:
+def manifest_from_librispeech(data_dir: str) -> List[Tuple[str, str]]:
     """
-    Load an audio file and resample to target_sr if needed.
+    Walk a LibriSpeech split directory and return (audio_path, reference) pairs.
 
-    Returns
-    -------
-    audio    : float32 numpy array, shape (N,)
-    duration : audio duration in seconds
+    Structure expected:
+      <data_dir>/<speaker>/<chapter>/<utt_id>.flac
+      <data_dir>/<speaker>/<chapter>/<speaker>-<chapter>.trans.txt
+
+    References are lowercased to match normalised ASR output.
     """
-    audio, sr = sf.read(path, dtype="float32", always_2d=False)
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)  # stereo → mono
+    data_path = Path(data_dir)
+    if not data_path.is_dir():
+        print(f"Error: data directory not found: {data_dir}", file=sys.stderr)
+        sys.exit(1)
 
-    if sr != target_sr:
-        try:
-            import resampy
-            audio = resampy.resample(audio, sr, target_sr)
-        except ImportError:
-            raise RuntimeError(
-                f"Audio '{path}' has sample rate {sr} Hz but target is {target_sr} Hz. "
-                "Install resampy to enable resampling: pip install resampy"
-            )
+    records: List[Tuple[str, str]] = []
+    for trans_file in sorted(data_path.rglob("*.trans.txt")):
+        chapter_dir = trans_file.parent
+        with open(trans_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) < 2:
+                    continue
+                utt_id, text = parts
+                for ext in (".flac", ".wav"):
+                    audio_path = chapter_dir / f"{utt_id}{ext}"
+                    if audio_path.exists():
+                        records.append((str(audio_path), text.lower()))
+                        break
 
-    duration = len(audio) / target_sr
-    return audio, duration
+    if not records:
+        print(f"Error: no audio files found under {data_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    return records
 
 
 # ---------------------------------------------------------------------------
-# Manifest parsing
+# Manifest parsing from TSV/CSV file
 # ---------------------------------------------------------------------------
 
 def load_manifest(path: str) -> List[Tuple[str, str]]:
-    """
-    Parse a manifest file into (audio_path, reference_text) pairs.
-
-    Accepts:
-      - TSV  (tab-separated)
-      - CSV  (comma-separated)
-    First column = audio path, second column = reference text.
-    Lines starting with '#' are treated as comments.
-    """
+    """Parse a TSV or CSV manifest into (audio_path, reference_text) pairs."""
     records: List[Tuple[str, str]] = []
     manifest_dir = Path(path).parent
 
     with open(path, newline="", encoding="utf-8") as f:
-        # Auto-detect delimiter
         sample = f.read(4096)
         f.seek(0)
         delimiter = "\t" if "\t" in sample else ","
@@ -104,14 +113,32 @@ def load_manifest(path: str) -> List[Tuple[str, str]]:
                 continue
             audio_path = row[0].strip()
             reference = row[1].strip()
-            # Resolve relative paths relative to the manifest directory
             if not Path(audio_path).is_absolute():
                 audio_path = str(manifest_dir / audio_path)
             records.append((audio_path, reference))
 
     if not records:
-        raise ValueError(f"No valid records found in manifest: {path}")
+        print(f"Error: no valid records in manifest: {path}", file=sys.stderr)
+        sys.exit(1)
     return records
+
+
+# ---------------------------------------------------------------------------
+# Audio loading
+# ---------------------------------------------------------------------------
+
+def load_audio(path: str, target_sr: int = 16000) -> Tuple[np.ndarray, float]:
+    """Load audio file, convert to mono float32, resample if needed."""
+    audio, sr = sf.read(path, dtype="float32", always_2d=False)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+
+    if sr != target_sr:
+        import resampy
+        audio = resampy.resample(audio, sr, target_sr)
+
+    duration = len(audio) / target_sr
+    return audio, duration
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +157,7 @@ def run_backend(
     print(f"\n{'='*60}")
     print(f"  Backend: {backend.name.upper()}")
     print(f"{'='*60}")
-    print(f"  Loading model … ", end="", flush=True)
+    print("  Loading model … ", end="", flush=True)
     t0 = time.monotonic()
     backend.load()
     load_time = time.monotonic() - t0
@@ -140,14 +167,14 @@ def run_backend(
         try:
             audio, duration = load_audio(audio_path, target_sr=sample_rate)
         except Exception as exc:
-            print(f"  [{i:4d}] SKIP {audio_path}: {exc}", flush=True)
+            print(f"  [{i:4d}] SKIP {Path(audio_path).name}: {exc}", flush=True)
             continue
 
         t_start = time.monotonic()
         try:
             hypothesis = backend.transcribe(audio, sample_rate=sample_rate)
         except Exception as exc:
-            print(f"  [{i:4d}] ERROR {audio_path}: {exc}", flush=True)
+            print(f"  [{i:4d}] ERROR {Path(audio_path).name}: {exc}", flush=True)
             hypothesis = ""
         proc_time = time.monotonic() - t_start
 
@@ -163,10 +190,10 @@ def run_backend(
 
         if verbose:
             print(
-                f"  [{i:4d}] RTF={utt.rtf:.3f}  WER={utt.wer*100:6.1f}%"
-                f"  REF: {reference[:60]}"
+                f"  [{i:4d}/{len(records)}] RTF={utt.rtf:.3f}  WER={utt.wer*100:6.1f}%"
             )
-            print(f"         HYP: {hypothesis[:60]}")
+            print(f"    REF: {reference[:80]}")
+            print(f"    HYP: {hypothesis[:80]}")
         else:
             marker = "✓" if utt.wer == 0.0 else "✗"
             print(
@@ -191,13 +218,10 @@ def run_backend(
 # ---------------------------------------------------------------------------
 
 def print_summary(summary: dict) -> None:
-    """Print a comparison table across all backends."""
-    backends = list(summary.keys())
     print("\n" + "=" * 60)
     print("  SUMMARY")
     print("=" * 60)
-    header = f"  {'Backend':<12}  {'WER (%)':>10}  {'Mean RTF':>10}  {'#Utts':>6}"
-    print(header)
+    print(f"  {'Backend':<12}  {'WER (%)':>10}  {'Mean RTF':>10}  {'#Utts':>6}")
     print("  " + "-" * 46)
     for name, agg in summary.items():
         print(
@@ -215,52 +239,61 @@ def build_parser() -> argparse.ArgumentParser:
         description="Benchmark WER and RTF for CPU ASR backends.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument(
-        "--manifest", required=True,
-        help="Path to TSV/CSV manifest: audio_path <sep> reference_text",
+
+    # Input source (mutually exclusive)
+    src = p.add_mutually_exclusive_group()
+    src.add_argument(
+        "--data-dir",
+        default=DEFAULT_DATA_DIR,
+        metavar="PATH",
+        help="LibriSpeech split directory (auto-generates manifest)",
     )
+    src.add_argument(
+        "--manifest",
+        metavar="FILE",
+        help="Pre-built TSV/CSV manifest: audio_path <sep> reference_text",
+    )
+
     p.add_argument(
         "--backends", nargs="+", choices=["onnx", "sherpa", "whisper"],
         default=["onnx", "sherpa", "whisper"],
         help="Which backends to benchmark",
     )
     p.add_argument("--sample-rate", type=int, default=16000)
-    p.add_argument(
-        "--threads", type=int, default=4,
-        help="CPU threads for all backends (overridden by backend-specific flags)",
-    )
+    p.add_argument("--threads", type=int, default=4,
+                   help="CPU threads for all backends (overridden by backend-specific flags)")
+    p.add_argument("--max-utts", type=int, default=None,
+                   help="Limit to first N utterances (for quick testing)")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print per-utterance REF/HYP lines")
     p.add_argument("--output", metavar="FILE",
-                   help="Save results to JSON file")
+                   help="Save full results to JSON file")
 
-    # ONNX backend options
-    g_onnx = p.add_argument_group("onnx backend")
-    g_onnx.add_argument("--onnx-model",
-                        default="nemo-parakeet-tdt-0.6b-v2",
-                        help="onnx-asr model name or local ONNX path")
-    g_onnx.add_argument("--onnx-threads", type=int, default=None,
-                        help="ONNX Runtime threads (defaults to --threads)")
+    # ONNX backend
+    g = p.add_argument_group("onnx backend")
+    g.add_argument("--onnx-model", default="nemo-parakeet-tdt-0.6b-v2",
+                   help="onnx-asr model name or local ONNX path")
+    g.add_argument("--onnx-threads", type=int, default=None)
 
-    # Sherpa backend options
-    g_sherpa = p.add_argument_group("sherpa backend")
-    g_sherpa.add_argument("--sherpa-model-dir", default="model",
-                          help="Directory containing Sherpa-ONNX model files")
-    g_sherpa.add_argument("--sherpa-threads", type=int, default=None,
-                          help="Sherpa-ONNX threads (defaults to --threads)")
-    g_sherpa.add_argument("--sherpa-chunk-size", type=float, default=0.1,
-                          help="Simulated streaming chunk size in seconds")
+    # Sherpa backend
+    g = p.add_argument_group("sherpa backend")
+    g.add_argument("--sherpa-model-dir", default=DEFAULT_SHERPA_MODEL,
+                   help="Directory with Sherpa-ONNX model files")
+    g.add_argument("--sherpa-threads", type=int, default=None)
+    g.add_argument("--sherpa-chunk-size", type=float, default=0.1,
+                   help="Simulated streaming chunk size in seconds")
+    g.add_argument("--sherpa-model-type", default="online",
+                   choices=["online", "nemo_transducer"],
+                   help="Model type: 'online' for Zipformer streaming, 'nemo_transducer' for NeMo Parakeet offline")
 
-    # Whisper backend options
-    g_whisper = p.add_argument_group("whisper backend")
-    g_whisper.add_argument("--whisper-model", default="small",
-                           help="Whisper model name (tiny/base/small/medium/large-v3)")
-    g_whisper.add_argument("--whisper-threads", type=int, default=None,
-                           help="faster-whisper threads (defaults to --threads)")
-    g_whisper.add_argument("--whisper-language", default="en",
-                           help="Language code or 'auto'")
-    g_whisper.add_argument("--whisper-beam-size", type=int, default=5,
-                           help="Beam size for decoding")
+    # Whisper backend
+    g = p.add_argument_group("whisper backend")
+    g.add_argument("--whisper-model", default="small",
+                   help="Model name (tiny/base/small/medium/large-v3) or local path")
+    g.add_argument("--whisper-threads", type=int, default=None)
+    g.add_argument("--whisper-language", default="en",
+                   help="Language code or 'auto' for detection")
+    g.add_argument("--whisper-beam-size", type=int, default=5)
 
     return p
 
@@ -269,8 +302,17 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    records = load_manifest(args.manifest)
-    print(f"Loaded {len(records)} utterances from {args.manifest}")
+    # Load records
+    if args.manifest:
+        records = load_manifest(args.manifest)
+        print(f"Loaded {len(records)} utterances from {args.manifest}")
+    else:
+        records = manifest_from_librispeech(args.data_dir)
+        print(f"Loaded {len(records)} utterances from {args.data_dir}")
+
+    if args.max_utts:
+        records = records[: args.max_utts]
+        print(f"Limited to first {len(records)} utterances (--max-utts)")
 
     # Build requested backends
     backend_map: dict[str, ASRBackend] = {}
@@ -285,6 +327,7 @@ def main() -> None:
             num_threads=args.sherpa_threads or args.threads,
             sample_rate=args.sample_rate,
             chunk_size=args.sherpa_chunk_size,
+            model_type=args.sherpa_model_type,
         )
     if "whisper" in args.backends:
         language = None if args.whisper_language == "auto" else args.whisper_language
@@ -309,8 +352,8 @@ def main() -> None:
             "aggregate": {
                 "wer_pct": agg.wer_pct,
                 "mean_rtf": agg.mean_rtf,
-                "total_audio_duration": agg.total_audio_duration,
-                "total_processing_time": agg.total_processing_time,
+                "total_audio_duration_s": agg.total_audio_duration,
+                "total_processing_time_s": agg.total_processing_time,
                 "n_utterances": agg.n_utterances,
             },
             "utterances": [
@@ -318,8 +361,8 @@ def main() -> None:
                     "audio_path": r.audio_path,
                     "reference": r.reference,
                     "hypothesis": r.hypothesis,
-                    "audio_duration": r.audio_duration,
-                    "processing_time": r.processing_time,
+                    "audio_duration_s": r.audio_duration,
+                    "processing_time_s": r.processing_time,
                     "edit_distance": r.edit_distance,
                     "wer": r.wer,
                     "rtf": r.rtf,
