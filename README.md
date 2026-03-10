@@ -5,9 +5,9 @@ CPU-only ASR backends on your own test data.
 
 | Backend | Library | Model |
 |---------|---------|-------|
-| `onnx` | [onnx-asr](https://github.com/yeyupiaoling/ONNX-ASR) + ONNX Runtime | NeMo Parakeet TDT 0.6B v2 |
-| `sherpa` | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Zipformer streaming transducer (EN, 2023-06-26), Parakeet TDT V2 EN |
-| `whisper` | [faster-whisper](https://github.com/guillaumekln/faster-whisper) (CTranslate2, int8) | Whisper small (or any size) |
+| [onnx](https://github.com/bagustris/live-asr-onnx) | [onnx-asr](https://github.com/yeyupiaoling/ONNX-ASR) + ONNX Runtime | NeMo Parakeet TDT 0.6B v2 |
+| [sherpa](https://github.com/bagustris/live-asr-sherpa) | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) | Zipformer streaming transducer (EN, 2023-06-26), Parakeet TDT V2 EN |
+| [whisper](https://github.com/bagustris/live-asr-whisper) | [faster-whisper](https://github.com/guillaumekln/faster-whisper) (CTranslate2, int8) | Whisper small (or any size) |
 
 ## Metrics
 
